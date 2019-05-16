@@ -44,6 +44,13 @@ func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoin
 		_, err = p.Signer.Sign(req, body, service.SigningName, service.SigningRegion, time.Now())
 		break
 	case "s3":
+		// See: https://github.com/aws/aws-sdk-go/blob/v1.19.31/aws/signer/v4/v4.go#L463-L466
+		// The URI path portion shouldn't be subject to escaping for S3 signatures.
+		// However, due to how our proxy request is created, the path will come
+		// through as escaped.
+		// If we discard the `RawPath` of the URL, the signature will only ever
+		// operate against the unescaped form (in `URL.Path`).
+		req.URL.RawPath = ""
 		_, err = p.Signer.Presign(req, body, service.SigningName, service.SigningRegion, time.Duration(time.Hour), time.Now())
 		break
 	default:
