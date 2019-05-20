@@ -45,6 +45,8 @@ func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoin
 		_, err = p.Signer.Sign(req, body, service.SigningName, service.SigningRegion, time.Now())
 		break
 	case "s3":
+		// The s3 case wants the path separators preserved in escaping.
+		req.URL.RawPath = EscapePathSegments(req.URL.Path)
 		_, err = p.S3Signer.Presign(req, body, service.SigningName, service.SigningRegion, time.Duration(time.Hour), time.Now())
 		break
 	default:
