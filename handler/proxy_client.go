@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -12,6 +13,20 @@ import (
 	"github.com/aws/aws-sdk-go/aws/signer/v4"
 	log "github.com/sirupsen/logrus"
 )
+
+// Unique context key type for header stripping control
+type RequestHeadersToStripType struct {}
+var RequestHeadersToStripKey = &RequestHeadersToStripType{}
+
+// Helper function for setting headers to strip
+func SetStripHeaders(ctx context.Context, h []string) context.Context {
+	return context.WithValue(ctx, RequestHeadersToStripKey, h)
+}
+
+// Helper function for retrieving headers to strip
+func GetStripHeaders(ctx context.Context) []string {
+	return ctx.Value(RequestHeadersToStripKey).([]string)
+}
 
 // Client is an interface to make testing http.Client calls easier
 type Client interface {
@@ -27,15 +42,20 @@ type ProxyClient struct {
 	StripRequestHeaders []string
 }
 
-func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoint) error {
+func (p *ProxyClient) PrepareRequestContext(req *http.Request) *http.Request {
+	return req.WithContext(SetStripHeaders(req.Context(), p.StripRequestHeaders))
+}
+
+func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoint) (*http.Request, error) {
 	body := bytes.NewReader([]byte{})
 
 	if req.Body != nil {
 		b, err := ioutil.ReadAll(req.Body)
 		if err != nil {
-			return err
+			return req, err
 		}
 
+		req.ContentLength = int64(len(b))
 		body = bytes.NewReader(b)
 	}
 
@@ -47,7 +67,13 @@ func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoin
 	case "s3":
 		// The s3 case wants the path separators preserved in escaping.
 		req.URL.RawPath = EscapePathSegments(req.URL.Path)
-		_, err = p.S3Signer.Presign(req, body, service.SigningName, service.SigningRegion, time.Duration(time.Hour), time.Now())
+		switch req.Method {
+		case http.MethodPut, http.MethodPost:
+			req = req.WithContext(SetStripHeaders(req.Context(), append(p.StripRequestHeaders, "Expect")))
+			_, err = p.S3Signer.Sign(req, body, service.SigningName, service.SigningRegion, time.Now())
+		default:
+			_, err = p.S3Signer.Presign(req, body, service.SigningName, service.SigningRegion, time.Duration(time.Hour), time.Now())
+		}
 		break
 	default:
 		err = fmt.Errorf("unable to sign with specified signing method %s for service %s", service.SigningMethod, service.SigningName)
@@ -58,7 +84,7 @@ func (p *ProxyClient) sign(req *http.Request, service *endpoints.ResolvedEndpoin
 		log.WithFields(log.Fields{"service": service.SigningName, "region": service.SigningRegion}).Debug("signed request")
 	}
 
-	return err
+	return req, err
 }
 
 func copyHeaderWithoutOverwrite(dst, src http.Header) {
@@ -77,7 +103,7 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	proxyURL.Scheme = "https"
 
 	if log.GetLevel() == log.DebugLevel {
-		initialReqDump, err := httputil.DumpRequest(req, true)
+		initialReqDump, err := httputil.DumpRequest(req, false)
 		if err != nil {
 			log.WithError(err).Error("unable to dump request")
 		}
@@ -88,18 +114,28 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	proxyReq = p.PrepareRequestContext(proxyReq)
 
 	service := determineAWSServiceFromHost(req.Host)
 	if service == nil {
 		return nil, fmt.Errorf("unable to determine service from host: %s", req.Host)
 	}
 
-	if err := p.sign(proxyReq, service); err != nil {
+	proxyReq, err = p.sign(proxyReq, service)
+	if err != nil {
 		return nil, err
 	}
 
+	// Hack for PUT to S3.
+	// Replace original request body because we read it from the proxy.
+	req.Body = proxyReq.Body
+	if req.Body != nil {
+		log.WithField("Content-Length", string(proxyReq.ContentLength)).Debug("Setting content-length on request")
+		req.ContentLength = proxyReq.ContentLength
+	}
+
 	// Remove any headers specified
-	for _, header := range p.StripRequestHeaders {
+	for _, header := range GetStripHeaders(proxyReq.Context()) {
 		log.WithField("StripHeader", string(header)).Debug("Stripping Header:")
 		req.Header.Del(header)
 	}
@@ -108,7 +144,7 @@ func (p *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	copyHeaderWithoutOverwrite(proxyReq.Header, req.Header)
 
 	if log.GetLevel() == log.DebugLevel {
-		proxyReqDump, err := httputil.DumpRequest(proxyReq, true)
+		proxyReqDump, err := httputil.DumpRequest(proxyReq, false)
 		if err != nil {
 			log.WithError(err).Error("unable to dump request")
 		}
