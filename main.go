@@ -31,9 +31,6 @@ func main() {
 		func(s *v4.Signer) {s.DisableURIPathEscaping = true},
 	)
 
-	log.WithFields(log.Fields{"StripHeaders": *strip}).Infof("Stripping headers %s", *strip)
-	log.WithFields(log.Fields{"port": *port}).Infof("Listening on %s", *port)
-
 	//log.Fatal(
 	//	http.ListenAndServe(*port, &handler.Handler{
 	//		ProxyClient: &handler.ProxyClient{
@@ -45,12 +42,18 @@ func main() {
 	//	}),
 	//)
 
-        log.Fatal(
-                http.ListenAndServe(*port, handler.BuildRouter(&handler.ProxyClient{
-                        Signer: signer,
-                        S3Signer: s3Signer,
-                        Client: http.DefaultClient,
-                        StripRequestHeaders: *strip,
-                })),
-        )
+	router := handler.BuildRouter(&handler.ProxyClient{
+		Signer: signer,
+		S3Signer: s3Signer,
+		Client: http.DefaultClient,
+		StripRequestHeaders: *strip,
+	})
+
+	if len(*strip) > 0 {
+		log.WithFields(log.Fields{"StripHeaders": *strip}).Infof("Stripping headers %s", *strip)
+		router = handler.StripHeaderHandler((*strip)[:], router)
+	}
+
+	log.WithFields(log.Fields{"port": *port}).Infof("Listening on %s", *port)
+	log.Fatal(http.ListenAndServe(*port, router))
 }
