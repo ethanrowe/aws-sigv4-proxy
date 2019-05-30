@@ -48,6 +48,9 @@ func escape(path string, flags []bool) string {
 // Amazon-style URL path escape, that includes the separators
 // in the escaping.
 func EscapePath(path string) string {
+  if path[0] == '/' {
+    return "/" + escape(path[1:], noEscape[:])
+  }
   return escape(path, noEscape[:])
 }
 

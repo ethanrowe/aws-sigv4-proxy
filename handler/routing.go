@@ -139,8 +139,8 @@ func RestoreHeadersWithoutOverwriteHandler(next http.Handler) http.Handler {
 	})
 }
 
-// sign the request
-func Sigv4SignHandler(signer *v4.Signer, next http.Handler) http.Handler {
+
+func sigv4SigningHandler(signfunc func(*http.Request, io.ReadSeeker, endpoints.ResolvedEndpoint) error, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ep := GetServiceEndpoint(r)
 		seeker, err := AsReadSeeker(r.Body)
@@ -150,7 +150,7 @@ func Sigv4SignHandler(signer *v4.Signer, next http.Handler) http.Handler {
 			return
 		}
 
-		_, err = signer.Sign(r, seeker, ep.SigningName, ep.SigningRegion, time.Now())
+		err = signfunc(r, seeker, ep)
 
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -167,32 +167,34 @@ func Sigv4SignHandler(signer *v4.Signer, next http.Handler) http.Handler {
 	})
 }
 
+// sign the request
+func Sigv4SignHandler(signer *v4.Signer, next http.Handler) http.Handler {
+	return sigv4SigningHandler(
+		func(r *http.Request, body io.ReadSeeker, ep endpoints.ResolvedEndpoint) error {
+			log.WithField("URL", r.URL.String()).
+				WithField("Host", r.Host).
+				WithField("Handler", "Sigv4SignHandler").
+				Info("Signing")
+			_, err := signer.Sign(r, body, ep.SigningName, ep.SigningRegion, time.Now())
+			return err
+		},
+		next,
+	)
+}
+
 // presign the request
 func Sigv4PresignHandler(signer *v4.Signer, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ep := GetServiceEndpoint(r)
-		seeker, err := AsReadSeeker(r.Body)
-		if err != nil {
-			log.WithError(err).Error("Failed to convert body to ReadSeeker for signing")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		_, err = signer.Presign(r, seeker, ep.SigningName, ep.SigningRegion, time.Duration(time.Hour), time.Now())
-
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		seeker.Seek(0, io.SeekStart)
-		closer, ok := seeker.(io.ReadCloser)
-		if ok {
-			r.Body = closer
-		}
-
-		next.ServeHTTP(w, r)
-	})
+	return sigv4SigningHandler(
+		func(r *http.Request, body io.ReadSeeker, ep endpoints.ResolvedEndpoint) error {
+			log.WithField("URL", r.URL.String()).
+				WithField("Host", r.Host).
+				WithField("Handler", "Sigv4PresignHandler").
+				Info("Presigning")
+			_, err := signer.Presign(r, body, ep.SigningName, ep.SigningRegion, time.Duration(time.Hour), time.Now())
+			return err
+		},
+		next,
+	)
 }
 
 // strip the specified headers off of the request object
@@ -402,7 +404,18 @@ func BuildRouter(p *ProxyClient) http.Handler {
 					"general AWS route entered",
 					EndpointContextHandler(
 						resolvedEndpoint,
-						LogServiceHandler(DefaultSignHandler()),
+						LogServiceHandler(
+							CanonicalizeRawPathHandler(
+								CreateProxyRequestHandler(
+									Sigv4SignHandler(
+										p.Signer,
+										RestoreHeadersWithoutOverwriteHandler(
+											DoProxyRequestHandler(p.Client),
+										),
+									),
+								),
+							),
+						),
 					),
 				),
 			)
