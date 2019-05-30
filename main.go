@@ -34,14 +34,23 @@ func main() {
 	log.WithFields(log.Fields{"StripHeaders": *strip}).Infof("Stripping headers %s", *strip)
 	log.WithFields(log.Fields{"port": *port}).Infof("Listening on %s", *port)
 
-	log.Fatal(
-		http.ListenAndServe(*port, &handler.Handler{
-			ProxyClient: &handler.ProxyClient{
-				Signer: signer,
-				S3Signer: s3Signer,
-				Client: http.DefaultClient,
-				StripRequestHeaders: *strip,
-			},
-		}),
-	)
+	//log.Fatal(
+	//	http.ListenAndServe(*port, &handler.Handler{
+	//		ProxyClient: &handler.ProxyClient{
+	//			Signer: signer,
+	//			S3Signer: s3Signer,
+	//			Client: http.DefaultClient,
+	//			StripRequestHeaders: *strip,
+	//		},
+	//	}),
+	//)
+
+        log.Fatal(
+                http.ListenAndServe(*port, handler.BuildRouter(&handler.ProxyClient{
+                        Signer: signer,
+                        S3Signer: s3Signer,
+                        Client: http.DefaultClient,
+                        StripRequestHeaders: *strip,
+                })),
+        )
 }
