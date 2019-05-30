@@ -215,8 +215,13 @@ func StripHeaderHandler(headers []string, next http.Handler) http.Handler {
 // to the original request received by the server)
 func DoProxyRequestHandler(client Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logger := log.
+			WithField("Handler", "DoProxyRequestHandler").
+			WithField("URL", r.URL.String()).
+			WithField("Method", r.Method).
+			WithField(BODY_SHA256_HEADER, r.Header.Get(BODY_SHA256_HEADER))
+
 		if log.GetLevel() == log.DebugLevel {
-			logger := log.WithField("handler", "DoProxyRequestHandler")
 			dump, err := httputil.DumpRequest(r, false)
 			if err != nil {
 				logger.WithError(err).Error("Unable to dump request")
@@ -232,25 +237,29 @@ func DoProxyRequestHandler(client Client) http.Handler {
 			return
 		}
 
+		logger.WithField("Status", resp.Status).Info("received response headers")
+
 		defer resp.Body.Close()
 
-		// read response body
-		buf := bytes.Buffer{}
-		if _, err := io.Copy(&buf, resp.Body); err != nil {
-			log.WithError(err).Error("unable to proxy request")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// copy headers
+		// Copy headers before setting the status, so they don't get
+		// interpreted as trailers.
 		for k, vals := range resp.Header {
 			for _, v := range vals {
 				w.Header().Add(k, v)
 			}
 		}
 
+		// Do this before writing anything else so we don't get a dumb default.
 		w.WriteHeader(resp.StatusCode)
-		w.Write(buf.Bytes())
+
+		// Now just stream the response body.
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			// Too late to change the response to an error.
+			log.WithError(err).Error("Failed while streaming response body after headers.")
+		} else {
+			logger.Info("Done with response")
+		}
 	})
 }
 
@@ -431,7 +440,7 @@ func BuildRouter(p *ProxyClient) http.Handler {
 				CanonicalizeRawPathSegmentsHandler(
 					FullBodyReadHandler(
 						CreateProxyRequestHandler(
-							Sigv4PresignHandler(
+							Sigv4SignHandler(
 								p.S3Signer,
 								RestoreHeadersWithoutOverwriteHandler(
 									DoProxyRequestHandler(p.Client),
