@@ -162,7 +162,9 @@ func RestoreHeadersWithoutOverwriteHandler(next http.Handler) http.Handler {
 		h := r.Header
 		logger := log.WithField("handler", "RestoreHeadersWithoutOverwriteHandler")
 		for k, vs := range GetOriginalRequestHeaders(r) {
-			if _, present := h[k]; ! present {
+			// Exclude headers we already have, and any headers related to the interpretation of the body size
+			// and transfer method (this gets handled elsewhere)
+			if _, present := h[k]; ! present && k != "Content-Length" && k != "Transfer-Encoding" && k != "Expect" {
 				for _, v := range vs {
 					h.Add(k, v)
 				}
