@@ -159,7 +159,17 @@ func CreateProxyRequestHandler(next http.Handler) http.Handler {
 // request.
 func RestoreHeadersWithoutOverwriteHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		copyHeaderWithoutOverwrite(r.Header, GetOriginalRequestHeaders(r))
+		h := r.Header
+		logger := log.WithField("handler", "RestoreHeadersWithoutOverwriteHandler")
+		for k, vs := range GetOriginalRequestHeaders(r) {
+			if _, present := h[k]; ! present {
+				for _, v := range vs {
+					h.Add(k, v)
+				}
+				logger = logger.WithField(k, vs)
+			}
+		}
+		logger.Debug("headers restored")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -489,9 +499,9 @@ func BuildRouter(p *ProxyClient) http.Handler {
 	// The core handlers are what happens in any case,
 	// after body handling is addressed.
 	s3CoreHandlers := CreateProxyRequestHandler(
-		Sigv4PresignHandler(
-			p.S3Signer,
-			RestoreHeadersWithoutOverwriteHandler(
+		RestoreHeadersWithoutOverwriteHandler(
+			Sigv4PresignHandler(
+				p.S3Signer,
 				DoProxyRequestHandler(p.Client),
 			),
 		),
