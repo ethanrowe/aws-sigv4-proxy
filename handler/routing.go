@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"encoding/hex"
 	"net/http"
@@ -33,6 +34,18 @@ func NewBodyCache(data []byte) *BodyCache {
 	return &BodyCache{
 		Reader: bytes.NewReader(data),
 	}
+}
+
+type NopSeeker struct {
+	io.ReadCloser
+}
+
+func (s *NopSeeker) Seek(offset int64, whence int) (int64, error) {
+	return 0, errors.New("NopSeeker is not really Seekable.")
+}
+
+func NewNopSeeker(r io.ReadCloser) *NopSeeker {
+	return &NopSeeker{ReadCloser: r}
 }
 
 type EndpointContextKeyType struct {}
@@ -97,6 +110,18 @@ func EndpointContextHandler(endpoint endpoints.ResolvedEndpoint, next http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Debug("EndpointContextHandler!")
 		next.ServeHTTP(w, WithServiceEndpoint(r, endpoint))
+	})
+}
+
+// Use a condition function to determine which handler to use
+func GateHandler(cond func(w http.ResponseWriter, r *http.Request) bool, ontrue, onfalse http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Debug("GateHandler!")
+		if cond(w, r) {
+			ontrue.ServeHTTP(w, r)
+		} else {
+			onfalse.ServeHTTP(w, r)
+		}
 	})
 }
 
@@ -230,6 +255,10 @@ func DoProxyRequestHandler(client Client) http.Handler {
 			}
 		}
 
+		if r.ContentLength == 0 {
+			r.Body = nil
+		}
+
 		resp, err := client.Do(r)
 
 		if err != nil {
@@ -237,7 +266,7 @@ func DoProxyRequestHandler(client Client) http.Handler {
 			return
 		}
 
-		logger.WithField("Status", resp.Status).Info("received response headers")
+		logger.WithField("Status", resp.Status).Debug("received response headers")
 
 		defer resp.Body.Close()
 
@@ -305,6 +334,26 @@ func LogServiceHandler(next http.Handler) http.Handler {
 	})
 }
 
+// Handler is suitable only for specific cases of writes to S3;
+// the content length needs to be explicitly known, and we need to
+// use presigning so the signature doesn't attempt to calculate
+// the content SHA256.
+// This works around some fussy opinions S3 has about Transfer-Encoding.
+func S3StreamableRequestBodyHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Makes this conform to io.ReadSeeker interface but returns an
+		// error on any attempt to Seek.
+		r.Body = NewNopSeeker(r.Body)
+		// We'll send the 100-continue automatically as soon as the body
+		// read begins, so don't bother forwarding it along to AWS.
+		r.Header.Del("Expect")
+		// S3 will barf on this header even if it's the relatively innocuous
+		// "chunked", so drop it.
+		r.TransferEncoding = make([]string, 0, 0)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func FullBodyReadHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method := r.Method
@@ -320,7 +369,7 @@ func FullBodyReadHandler(next http.Handler) http.Handler {
 				// will default to 0; the Expect header must be present and the client may be waiting for 100-continue.
 				// But the net/http stack won't auto-send the 100-continue line with content length 0.
 				// We're supporting this non-standard behavior for S3 in particular.
-				if r.ContentLength == 0 {
+				if r.ContentLength == 0 && r.Header.Get("Content-Length") == "" {
 				  // l.Info("Forcing non-standard HTTP/1.1 100 Continue")
 					// This would require connection hijack, which let's not do unless we have to.
 				  // w.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
@@ -340,9 +389,12 @@ func FullBodyReadHandler(next http.Handler) http.Handler {
 
 				r.Body = NewBodyCache(data)
 				r.ContentLength = int64(len(data))
+				if r.ContentLength > 0 {
+					r.Header.Set(BODY_SHA256_HEADER, hashdigest)
+				}
+
 				r.TransferEncoding = make([]string, 0, 0)
 				r.Header.Del("Expect")
-				r.Header.Set(BODY_SHA256_HEADER, hashdigest)
 				l.WithField("ContentLength", r.ContentLength).
 				  WithField(BODY_SHA256_HEADER, hashdigest).
 					Info("FullBodyReadHandler cached body before proxying")
@@ -432,25 +484,46 @@ func BuildRouter(p *ProxyClient) http.Handler {
 		}
 	}
 
+	// We have two code paths for S3 depending on
+	// whether a PUT body can be streamed or not.
+	// The core handlers are what happens in any case,
+	// after body handling is addressed.
+	s3CoreHandlers := CreateProxyRequestHandler(
+		Sigv4PresignHandler(
+			p.S3Signer,
+			RestoreHeadersWithoutOverwriteHandler(
+				DoProxyRequestHandler(p.Client),
+			),
+		),
+	)
+
 	return RegexpEndpointRoutingHandler(
 		"^(?:[^.]+\\.)?(s3\\.(?:[-a-z0-9]+\\.)?amazonaws\\.com(?:\\.cn)?)$",
 		LogMessageHandler(
 			"s3 regexp route entered",
 			LogServiceHandler(
 				CanonicalizeRawPathSegmentsHandler(
-					FullBodyReadHandler(
-						CreateProxyRequestHandler(
-							Sigv4SignHandler(
-								p.S3Signer,
-								RestoreHeadersWithoutOverwriteHandler(
-									DoProxyRequestHandler(p.Client),
-								),
-							),
+					GateHandler(
+						func(w http.ResponseWriter, r *http.Request) bool {
+							// a PUT of an explicit length can be streamed without the signature reading it.
+							// Note that because of net/http.Request's automatic sending of headers,
+							// we can't do the case of content length 0 in this way (transfer-encoding will
+							// automatically get added; better to have nil body)
+							return r.Method == http.MethodPut && r.ContentLength > 0
+						},
+						// the streamble PUT case
+						LogMessageHandler(
+							"s3 streamable put body",
+							S3StreamableRequestBodyHandler(s3CoreHandlers),
 						),
+						// all other cases
+						FullBodyReadHandler(s3CoreHandlers),
 					),
 				),
 			),
 		),
+		// If our bucket-subdomain-aware S3 regex doesn't match the hostname, we delegate to the servemux
+		// for hostname-to-endpoint matching.
 		mux,
 	)
 }
