@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"io"
@@ -242,6 +244,89 @@ func StripHeaderHandler(headers []string, next http.Handler) http.Handler {
 		for _, header := range headers {
 			logger.WithField("header", header).Debug("strip.")
 			r.Header.Del(header)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type BareResponseWriter struct {
+	conn net.Conn
+	bufrw *bufio.ReadWriter
+	header http.Header
+	wroteHeaders bool
+	proto string
+}
+
+func NewBareResponseWriter(cn net.Conn, buf *bufio.ReadWriter, protocol string) *BareResponseWriter {
+	return &BareResponseWriter{
+		conn: cn,
+		bufrw: buf,
+		header: make(http.Header),
+		wroteHeaders: false,
+		proto: protocol,
+	}
+}
+
+func (rw *BareResponseWriter) Flush() {
+	rw.bufrw.Flush()
+}
+
+func (rw *BareResponseWriter) Close() {
+	log.Debug("Flushing and closing BareResponseWriter")
+	rw.bufrw.Flush()
+	rw.conn.Close()
+}
+
+func (rw *BareResponseWriter) Header() http.Header {
+	return rw.header
+}
+
+func (rw *BareResponseWriter) RawWrite(b []byte) (int, error) {
+	return rw.bufrw.Write(b)
+}
+
+func (rw *BareResponseWriter) Write(b []byte) (int, error) {
+	if ! rw.wroteHeaders {
+		rw.writeStatus(http.StatusOK)
+	}
+	return rw.RawWrite(b)
+}
+
+func (rw *BareResponseWriter) WriteHeader(statusCode int) {
+	if rw.wroteHeaders {
+		log.WithField("statusCode", statusCode).Warn("superfluous call of WriteHeader on BareResponseWriter")
+		return
+	}
+	rw.writeStatus(statusCode)
+	rw.header.WriteSubset(rw.bufrw, nil)
+	rw.bufrw.WriteString("\r\n")
+	rw.wroteHeaders = false
+}
+
+func (rw *BareResponseWriter) writeStatus(statusCode int) {
+	fmt.Fprintf(rw.bufrw, "%s %03d %d\r\n", rw.proto, statusCode, http.StatusText(statusCode))
+}
+
+func S3EmptyExpect100ContinueHandler(next http.Handler) http.Handler {
+	logger := log.WithField("Handler", "S3EmptyExpect100ContinueHandler")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			cn, bf, err := hj.Hijack()
+			if err == nil {
+				rawWriter := NewBareResponseWriter(cn, bf, r.Proto)
+				defer rawWriter.Close()
+				_, err = rawWriter.RawWrite([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
+				if err != nil {
+					logger.WithError(err).Error("Error sending 100-continue!")
+				}
+				rawWriter.Flush()
+				w = rawWriter 
+			} else {
+				logger.WithError(err).Error("Error hijacking ResponseWriter!")
+			}
+		} else {
+			logger.Error("Cannot hijack ResponseWriter!")
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -529,7 +614,20 @@ func BuildRouter(p *ProxyClient) http.Handler {
 							S3StreamableRequestBodyHandler(s3CoreHandlers),
 						),
 						// all other cases
-						FullBodyReadHandler(s3CoreHandlers),
+						GateHandler(
+							func(w http.ResponseWriter, r *http.Request) bool {
+								// a PUT of explicit length with 0 content length, and a 100-expect continue,
+								// will receive a 100-continue.
+								return r.Method == http.MethodPut && r.Header.Get("Content-Length") == "0" && r.Header.Get("Expect") == "100-continue"
+							},
+							// Special response hijacker that forces a 100-continue response and then does the proxy request.
+							LogMessageHandler(
+								"s3 empty body expect-100-continue handler",
+								S3EmptyExpect100ContinueHandler(s3CoreHandlers),
+							),
+							// Everything else.
+							FullBodyReadHandler(s3CoreHandlers),
+						),
 					),
 				),
 			),
