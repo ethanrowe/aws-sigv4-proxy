@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"regexp"
 	"crypto/sha256"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/endpoints"
@@ -332,10 +333,28 @@ func S3EmptyExpect100ContinueHandler(next http.Handler) http.Handler {
 	})
 }
 
+type LegacyHeaderMap map[string]string
+
+func NewLegacyHeaderMap(legacyKeys... string) LegacyHeaderMap {
+	m := make(LegacyHeaderMap)
+	for _, legacyKey := range legacyKeys {
+		m[strings.ToLower(legacyKey)] = legacyKey
+	}
+	return m
+}
+
+func (m *LegacyHeaderMap) MapKey(key string) string {
+	mapped, ok := (*m)[strings.ToLower(key)]
+	if ok {
+		return mapped
+	}
+	return key
+}
+
 // Actually issue the request and delegate response to it.
 // Assumes the request passed in is structured for proxying (as opposed
 // to the original request received by the server)
-func DoProxyRequestHandler(client Client) http.Handler {
+func DoProxyRequestHandler(client Client, headerMap LegacyHeaderMap) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logger := log.
 			WithField("Handler", "DoProxyRequestHandler").
@@ -369,10 +388,9 @@ func DoProxyRequestHandler(client Client) http.Handler {
 
 		// Copy headers before setting the status, so they don't get
 		// interpreted as trailers.
+		outHeader := w.Header()
 		for k, vals := range resp.Header {
-			for _, v := range vals {
-				w.Header().Add(k, v)
-			}
+			outHeader[headerMap.MapKey(k)] = vals
 		}
 
 		// Do this before writing anything else so we don't get a dumb default.
@@ -533,6 +551,7 @@ func RegexpEndpointRoutingHandler(pattern string, next, nomatch http.Handler) ht
 }
 
 func BuildRouter(p *ProxyClient) http.Handler {
+	noHeaderMap := NewLegacyHeaderMap()
 	mux := &http.ServeMux{}
 
 	for hostname, resolvedEndpoint := range services {
@@ -568,7 +587,7 @@ func BuildRouter(p *ProxyClient) http.Handler {
 									Sigv4SignHandler(
 										p.Signer,
 										RestoreHeadersWithoutOverwriteHandler(
-											DoProxyRequestHandler(p.Client),
+											DoProxyRequestHandler(p.Client, noHeaderMap),
 										),
 									),
 								),
@@ -589,7 +608,9 @@ func BuildRouter(p *ProxyClient) http.Handler {
 		RestoreHeadersWithoutOverwriteHandler(
 			Sigv4PresignHandler(
 				p.S3Signer,
-				DoProxyRequestHandler(p.Client),
+				// Preserve the non-canonical casing of the "Etag" header
+				// for case-sensitive irritating clients.
+				DoProxyRequestHandler(p.Client, NewLegacyHeaderMap("ETag")),
 			),
 		),
 	)
