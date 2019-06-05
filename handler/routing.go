@@ -333,14 +333,18 @@ func S3EmptyExpect100ContinueHandler(next http.Handler) http.Handler {
 	})
 }
 
+type HeaderMapper interface {
+	MapKey(string) string
+}
+
 type LegacyHeaderMap map[string]string
 
-func NewLegacyHeaderMap(legacyKeys... string) LegacyHeaderMap {
+func NewLegacyHeaderMap(legacyKeys... string) *LegacyHeaderMap {
 	m := make(LegacyHeaderMap)
 	for _, legacyKey := range legacyKeys {
 		m[strings.ToLower(legacyKey)] = legacyKey
 	}
-	return m
+	return &m
 }
 
 func (m *LegacyHeaderMap) MapKey(key string) string {
@@ -351,10 +355,30 @@ func (m *LegacyHeaderMap) MapKey(key string) string {
 	return key
 }
 
+type HeaderMapperFunc struct {
+	mapper func(string) string
+}
+
+func NewHeaderMapperFunc(mapfunc func(string)string) *HeaderMapperFunc {
+	return &HeaderMapperFunc{
+		mapper: mapfunc,
+	}
+}
+
+func (m *HeaderMapperFunc) MapKey(key string) string {
+	return m.mapper(key)
+}
+
+func CombineMappers(a, b HeaderMapper) HeaderMapper {
+	return NewHeaderMapperFunc(func(k string) string {
+		return b.MapKey(a.MapKey(k))
+	})
+}
+
 // Actually issue the request and delegate response to it.
 // Assumes the request passed in is structured for proxying (as opposed
 // to the original request received by the server)
-func DoProxyRequestHandler(client Client, headerMap LegacyHeaderMap) http.Handler {
+func DoProxyRequestHandler(client Client, headerMap HeaderMapper) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logger := log.
 			WithField("Handler", "DoProxyRequestHandler").
@@ -600,6 +624,24 @@ func BuildRouter(p *ProxyClient) http.Handler {
 		}
 	}
 
+	// We need two header mappers composed together to get the header
+	// behavior S3 publishes.  See:
+	// https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html?shortFooter=true#object-metadata
+	s3LegacyHeaderMapper := NewLegacyHeaderMap(
+		"Content-MD5",
+		"ETag",
+	)
+
+	// All other S3 standard headers either:
+	// * follow the canonical form
+	// * or are lower-case "x-amz-" (including "x-amz-meta-")
+	s3AmzHeaderMapper := NewHeaderMapperFunc(func(key string) string {
+		if strings.HasPrefix(key, "X-Amz-") {
+			key = strings.ToLower(key)
+		}
+		return key
+	})
+
 	// We have two code paths for S3 depending on
 	// whether a PUT body can be streamed or not.
 	// The core handlers are what happens in any case,
@@ -608,9 +650,7 @@ func BuildRouter(p *ProxyClient) http.Handler {
 		RestoreHeadersWithoutOverwriteHandler(
 			Sigv4PresignHandler(
 				p.S3Signer,
-				// Preserve the non-canonical casing of the "Etag" header
-				// for case-sensitive irritating clients.
-				DoProxyRequestHandler(p.Client, NewLegacyHeaderMap("ETag")),
+				DoProxyRequestHandler(p.Client, CombineMappers(s3AmzHeaderMapper, s3LegacyHeaderMapper)),
 			),
 		),
 	)
